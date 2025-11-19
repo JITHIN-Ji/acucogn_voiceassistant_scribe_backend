@@ -4,16 +4,15 @@ import os
 import json
 import uuid
 import tempfile
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import logging
 
-# Ensure these imports are correct based on your project structure
-# Assuming backend_api.py is in the root, and app/ is a sibling directory.
-# You might need to adjust your PYTHONPATH or ensure your IDE recognizes 'app' as a package.
-# Example for running: `uvicorn backend_api:app --host 0.0.0.0 --port 5000` from project root
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from auth.google_auth import verify_google_token, create_jwt_token, verify_jwt_token
+from auth.middleware import get_current_user, optional_auth
 from pipeline.core import MedicalAudioProcessor
 from agent.config import set_session_id, logger, GEMINI_API_KEY
 from agent.core import process_appointment
@@ -394,3 +393,71 @@ async def get_patient_api(token_id: str):
             },
             status_code=500
         )
+    
+
+# --- Authentication Endpoints ---
+
+@app.post("/auth/google")
+async def google_auth(payload: dict):
+    """
+    Verify Google OAuth token and return JWT token.
+    Expects: {"token": "google_oauth_token"}
+    """
+    session_id = set_session_id(str(uuid.uuid4())[:8])
+    logger.info(f"[{session_id}] Google authentication attempt")
+    
+    google_token = payload.get('token')
+    if not google_token:
+        raise HTTPException(status_code=400, detail="Google token is required")
+    
+    # Verify Google token
+    user_data = verify_google_token(google_token)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+    
+    # Create JWT token
+    jwt_token = create_jwt_token(user_data)
+    
+    logger.info(f"[{session_id}] User authenticated: {user_data['email']}")
+    
+    return JSONResponse(
+        content={
+            "status": "success",
+            "token": jwt_token,
+            "user": {
+                "email": user_data['email'],
+                "name": user_data['name'],
+                "picture": user_data['picture']
+            }
+        },
+        status_code=200
+    )
+
+@app.get("/auth/verify")
+async def verify_auth(user: dict = Depends(get_current_user)):
+    """
+    Verify if the current JWT token is valid.
+    Requires Authorization header with Bearer token.
+    """
+    return JSONResponse(
+        content={
+            "status": "success",
+            "user": {
+                "email": user['email'],
+                "name": user['name'],
+                "picture": user.get('picture', '')
+            }
+        },
+        status_code=200
+    )
+
+@app.post("/auth/logout")
+async def logout(user: dict = Depends(get_current_user)):
+    """
+    Logout endpoint (client should delete token).
+    """
+    logger.info(f"User logged out: {user['email']}")
+    return JSONResponse(
+        content={"status": "success", "message": "Logged out successfully"},
+        status_code=200
+    )

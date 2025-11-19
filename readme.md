@@ -105,3 +105,4 @@ The app will:
 
 
 
+.\.venv\Scripts\Activate.ps1
