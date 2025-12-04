@@ -14,6 +14,18 @@ from typing import List, Dict, Optional
 
 from database.supabase_client import supabase
 
+import io
+import base64
+from utils.crypto import (
+    encrypt_text,
+    decrypt_text,
+    encrypt_json,
+    decrypt_json,
+    encrypt_bytes,
+    decrypt_bytes,
+)
+
+
 logger = logging.getLogger("PatientDB")
 
 
@@ -23,12 +35,13 @@ def generate_token_id() -> str:
 
 def create_patient(name: str, address: str = '', phone_number: str = '', problem: str = '') -> Dict:
     token_id = generate_token_id()
+
     payload = {
         'token_id': token_id,
-        'name': name,
-        'address': address,
-        'phone_number': phone_number,
-        'problem': problem,
+        'name': encrypt_text(name),
+        'address': encrypt_text(address),
+        'phone_number': encrypt_text(phone_number),
+        'problem': encrypt_text(problem),
     }
     res = supabase.table('patients').insert(payload).execute()
     if getattr(res, 'error', None):
@@ -44,7 +57,21 @@ def get_all_patients() -> List[Dict]:
     if getattr(res, 'error', None):
         logger.error(f"Supabase get_all_patients error: {res.error}")
         raise Exception(res.error)
-    return res.data or []
+    rows = res.data or []
+    
+    for r in rows:
+        try:
+            if 'name' in r and r.get('name'):
+                r['name'] = decrypt_text(r.get('name'))
+            if 'address' in r and r.get('address'):
+                r['address'] = decrypt_text(r.get('address'))
+            if 'phone_number' in r and r.get('phone_number'):
+                r['phone_number'] = decrypt_text(r.get('phone_number'))
+            if 'problem' in r and r.get('problem'):
+                r['problem'] = decrypt_text(r.get('problem'))
+        except Exception:
+            logger.exception('Failed to decrypt patient fields')
+    return rows
 
 
 def get_patient_by_token(token_id: str) -> Optional[Dict]:
@@ -53,20 +80,33 @@ def get_patient_by_token(token_id: str) -> Optional[Dict]:
         logger.error(f"Supabase get_patient_by_token error: {res.error}")
         raise Exception(res.error)
     data = res.data or []
-    return data[0] if data else None
+    patient = data[0] if data else None
+    if patient:
+        try:
+            if patient.get('name'):
+                patient['name'] = decrypt_text(patient.get('name'))
+            if patient.get('address'):
+                patient['address'] = decrypt_text(patient.get('address'))
+            if patient.get('phone_number'):
+                patient['phone_number'] = decrypt_text(patient.get('phone_number'))
+            if patient.get('problem'):
+                patient['problem'] = decrypt_text(patient.get('problem'))
+        except Exception:
+            logger.exception('Failed to decrypt patient')
+    return patient
 
 
 def update_patient(token_id: str, name: str = None, address: str = None,
                    phone_number: str = None, problem: str = None) -> bool:
     updates = {}
     if name is not None:
-        updates['name'] = name
+        updates['name'] = encrypt_text(name)
     if address is not None:
-        updates['address'] = address
+        updates['address'] = encrypt_text(address)
     if phone_number is not None:
-        updates['phone_number'] = phone_number
+        updates['phone_number'] = encrypt_text(phone_number)
     if problem is not None:
-        updates['problem'] = problem
+        updates['problem'] = encrypt_text(problem)
     if not updates:
         return False
     updates['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
@@ -94,25 +134,34 @@ def save_soap_record(patient_token_id: str, audio_file_name: str = None, audio_l
     """
     storage_path = None
     try:
-        # Upload file to Supabase Storage if local path provided
+        
         if audio_local_path and os.path.exists(audio_local_path):
             bucket = os.getenv('SUPABASE_STORAGE_BUCKET', )
             timestamp = int(time.time())
             filename = audio_file_name or os.path.basename(audio_local_path)
             storage_path = f"{patient_token_id}/{timestamp}_{filename}"
             with open(audio_local_path, 'rb') as f:
-                upload_res = supabase.storage.from_(bucket).upload(storage_path, f)
-            # upload_res may be dict-like or response object
+                raw = f.read()
+            try:
+                enc_b64 = encrypt_bytes(raw)
+                enc_bytes = base64.b64decode(enc_b64)
+                upload_res = supabase.storage.from_(bucket).upload(storage_path, enc_bytes)
+                logger.info(f"Uploaded audio file to Supabase storage: {storage_path}")
+            except Exception:
+                logger.exception('Failed to encrypt/upload audio file')
+                raise
+            
             if isinstance(upload_res, dict) and upload_res.get('error'):
                 logger.error(f"Supabase storage upload error: {upload_res.get('error')}")
                 raise Exception(upload_res.get('error'))
 
+        
         payload = {
             'patient_token_id': patient_token_id,
             'audio_file_name': audio_file_name,
-            'transcript': transcript,
-            'original_transcript': original_transcript,
-            'soap_sections': soap_sections or {}
+            'transcript': encrypt_text(transcript),
+            'original_transcript': encrypt_text(original_transcript) if original_transcript is not None else None,
+            'soap_sections': encrypt_json(soap_sections or {})
         }
         res = supabase.table('soap_records').insert(payload).execute()
         if getattr(res, 'error', None):
@@ -121,7 +170,7 @@ def save_soap_record(patient_token_id: str, audio_file_name: str = None, audio_l
         record = (res.data or [None])[0]
         if record is None:
             raise Exception('Failed to insert soap record')
-        # If storage_path exists, also insert into voice_recordings table linking to record.id
+        
         if storage_path:
             rec_id = record.get('id')
             voice_payload = {
@@ -135,6 +184,16 @@ def save_soap_record(patient_token_id: str, audio_file_name: str = None, audio_l
             if getattr(vres, 'error', None):
                 logger.error(f"Supabase insert voice_recordings error: {vres.error}")
         record['storage_path'] = storage_path
+        
+        try:
+            if record.get('transcript'):
+                record['transcript'] = decrypt_text(record.get('transcript'))
+            if record.get('original_transcript'):
+                record['original_transcript'] = decrypt_text(record.get('original_transcript'))
+            if record.get('soap_sections'):
+                record['soap_sections'] = decrypt_json(record.get('soap_sections'))
+        except Exception:
+            logger.exception('Failed to decrypt soap record')
         return record
     except Exception as e:
         logger.error(f"Error saving SOAP record to Supabase: {e}")
@@ -146,7 +205,18 @@ def get_patient_soap_records(patient_token_id: str) -> List[Dict]:
     if getattr(res, 'error', None):
         logger.error(f"Supabase get_patient_soap_records error: {res.error}")
         raise Exception(res.error)
-    return res.data or []
+    rows = res.data or []
+    for r in rows:
+        try:
+            if r.get('transcript'):
+                r['transcript'] = decrypt_text(r.get('transcript'))
+            if r.get('original_transcript'):
+                r['original_transcript'] = decrypt_text(r.get('original_transcript'))
+            if r.get('soap_sections'):
+                r['soap_sections'] = decrypt_json(r.get('soap_sections'))
+        except Exception:
+            logger.exception('Failed to decrypt soap record')
+    return rows
 
 
 def get_latest_soap_record(patient_token_id: str) -> Optional[Dict]:
@@ -155,7 +225,9 @@ def get_latest_soap_record(patient_token_id: str) -> Optional[Dict]:
 
 
 def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
-    res = supabase.table('soap_records').update({'soap_sections': soap_sections, 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}).eq('id', record_id).execute()
+    
+    enc = encrypt_json(soap_sections)
+    res = supabase.table('soap_records').update({'soap_sections': enc, 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}).eq('id', record_id).execute()
     if getattr(res, 'error', None):
         logger.error(f"Supabase update_soap_record error: {res.error}")
         raise Exception(res.error)
@@ -168,8 +240,14 @@ def save_voice_recording(patient_token_id: str, soap_record_id: int, file_path: 
     timestamp = int(time.time())
     storage_path = f"{patient_token_id}/{timestamp}_{file_name}"
     try:
+        
         with open(file_path, 'rb') as f:
-            upload_res = supabase.storage.from_(bucket).upload(storage_path, f)
+            raw = f.read()
+        enc_b64 = encrypt_bytes(raw)
+        enc_bytes = base64.b64decode(enc_b64)
+        upload_res = supabase.storage.from_(bucket).upload(storage_path, enc_bytes)
+        logger.info(f"Uploaded audio file to Supabase storage: {storage_path}")
+        
         if isinstance(upload_res, dict) and upload_res.get('error'):
             logger.error(f"Supabase storage upload error: {upload_res.get('error')}")
             raise Exception(upload_res.get('error'))

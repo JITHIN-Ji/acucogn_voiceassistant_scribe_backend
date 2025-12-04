@@ -4,10 +4,15 @@ import uuid
 import tempfile
 import time
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Request
+import mimetypes
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import logging
+import base64
+import io
+from fastapi.responses import StreamingResponse
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from auth.google_auth import verify_google_token, create_jwt_token, verify_jwt_token
@@ -17,27 +22,27 @@ from agent.config import set_session_id, logger, GEMINI_API_KEY
 from agent.core import process_appointment
 from user.chat_service import process_user_question
 from database.patient_db import create_patient, get_all_patients, get_patient_by_token, save_soap_record, get_patient_soap_records, get_voice_recordings
+from database.supabase_client import supabase
+from utils.crypto import decrypt_bytes
 
-# Load environment variables
 load_dotenv()
 
-# --- FastAPI App Setup ---
 app = FastAPI(
     title="Medical Audio Processor API",
     description="API for processing medical audio, generating SOAP notes, and executing treatment plans.",
     version="1.0.0"
 )
 
-# Configure CORS for local development with React Native
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for development. In production, restrict this.
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Lifecycle Logs ---
+
 @app.on_event("startup")
 async def on_startup():
     logger.info("🚀 Backend startup: FastAPI application is initializing.")
@@ -50,13 +55,8 @@ async def on_shutdown():
 UPLOAD_FOLDER = 'recordings_backend'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# --- Global MedicalAudioProcessor Instance ---
-# This ensures models are initialized once when the FastAPI app starts
 logger.info("Initializing MedicalAudioProcessor for backend...")
 processor = MedicalAudioProcessor(UPLOAD_FOLDER)
-
-
-# --- API Endpoints ---
 
 @app.get("/")
 async def root():
@@ -74,12 +74,16 @@ async def process_audio_api(
     Processes an uploaded audio file to generate a medical transcript and SOAP summary.
     If patient_token_id is provided, saves the result to the database.
     """
-    # Track overall timing
+    
     overall_start = time.time()
     
-    # Use provided session_id if available, else generate a new one
+    
     session_id = set_session_id(session_id or str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] ▶️ Process audio START. Filename: {audio.filename}, Patient Token: {patient_token_id}")
+    
+    if not patient_token_id:
+        logger.warning(f"[{session_id}] Missing patient_token_id in request - rejecting.")
+        raise HTTPException(status_code=400, detail="Patient selection required. Please choose a patient before processing audio.")
 
     if not audio.filename:
         logger.error(f"[{session_id}] No audio file provided.")
@@ -87,7 +91,7 @@ async def process_audio_api(
 
     
     try:
-        # Create a temporary file to save the uploaded audio
+        
         file_save_start = time.time()
         with tempfile.NamedTemporaryFile(delete=False, dir=UPLOAD_FOLDER, suffix=os.path.splitext(audio.filename)[1]) as temp_audio_file:
             contents = await audio.read()
@@ -96,7 +100,7 @@ async def process_audio_api(
         file_save_time = time.time() - file_save_start
         logger.info(f"[{session_id}] 📁 Audio file saved to {filepath} (Time: {file_save_time:.2f}s)")
 
-        # Transcribe with Deepgram directly (no WAV conversion to avoid large uploads)
+        
         logger.info(f"[{session_id}] 🎙️ Starting transcription with Deepgram...")
         transcription_start = time.time()
         transcript, diarized_segments = processor.transcribe_file(filepath)
@@ -133,10 +137,10 @@ async def process_audio_api(
         soap_sections = gemini_summary_raw
         logger.info(f"[{session_id}] 🧴 SOAP sections created: {list(soap_sections.keys()) if isinstance(soap_sections, dict) else 'unknown'} (Time: {soap_time:.2f}s)")
 
-        # Calculate total time
+    
         total_time = time.time() - overall_start
         
-        # Log timing summary
+        
         logger.info(f"[{session_id}] ⏱️ TIMING SUMMARY:")
         logger.info(f"[{session_id}]   • File Save: {file_save_time:.2f}s")
         logger.info(f"[{session_id}]   • Deepgram Transcription: {transcription_time:.2f}s")
@@ -146,8 +150,8 @@ async def process_audio_api(
         logger.info(f"[{session_id}]   • TOTAL TIME: {total_time:.2f}s")
 
         response_data = {
-            "transcript": corrected_transcript,  # Return corrected transcript for Option 1, original for Option 2
-            "original_transcript": transcript if is_realtime_flag else None,  # Include original for Option 1
+            "transcript": corrected_transcript, 
+            "original_transcript": transcript if is_realtime_flag else None,  
             "diarized_segments": diarized_segments,
             "soap_sections": soap_sections,
             "audio_file_name": audio.filename,
@@ -160,10 +164,10 @@ async def process_audio_api(
             }
         }
         
-        # Save SOAP record to database if patient_token_id is provided
+        
         if patient_token_id:
             try:
-                # save SOAP record and upload audio file to Supabase storage
+                
                 soap_record = save_soap_record(
                     patient_token_id=patient_token_id,
                     audio_file_name=audio.filename,
@@ -176,7 +180,7 @@ async def process_audio_api(
                 logger.info(f"[{session_id}] ✅ SOAP record saved to database with ID: {soap_record['id']}")
             except Exception as db_error:
                 logger.error(f"[{session_id}] Warning: Failed to save SOAP record to database: {db_error}")
-                # Don't fail the API call if DB save fails - still return the processed data
+                
         
         logger.info(f"[{session_id}] ⏹️ Process audio END. Success; sending response.")
         return JSONResponse(content=response_data, status_code=200)
@@ -185,7 +189,7 @@ async def process_audio_api(
         logger.error(f"[{session_id}] Error during audio processing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     finally:
-        # Clean up the temporary audio file
+        
         if 'filepath' in locals() and os.path.exists(filepath):
             os.remove(filepath)
             logger.info(f"[{session_id}] Cleaned up temporary audio file: {filepath}")
@@ -197,18 +201,17 @@ async def approve_plan_api(payload: dict):
     Approves the extracted medical plan and executes agent actions
     like processing medicines and scheduling appointments.
     """
-    # Track timing
+
     overall_start = time.time()
     
-    # Reuse client-provided session_id if present to correlate logs across requests
     client_session_id = payload.get('session_id') if isinstance(payload, dict) else None
     session_id = set_session_id(client_session_id or str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] Received request for plan approval.")
 
     plan_section = payload.get('plan_section')
-    user_email = payload.get('user_email', 'default_patient@example.com') # Fallback email
+    user_email = payload.get('user_email', 'default_patient@example.com') 
     send_email = bool(payload.get('send_email', True))
-    custom_email_content = payload.get('email_content')  # Doctor's edited email content
+    custom_email_content = payload.get('email_content')  
 
     if not plan_section or plan_section.strip().lower() == "n/a":
         logger.warning(f"[{session_id}] No valid plan section provided for approval.")
@@ -233,8 +236,7 @@ async def approve_plan_api(payload: dict):
 
         if appointment_preview_res["status"] == "success" and "email_content" in appointment_preview_res:
             if send_email:
-                # If email content was generated and sending requested, now actually send it
-                # Use custom email content if provided (doctor's edited version)
+                
                 if custom_email_content:
                     logger.info(f"[{session_id}] Sending appointment email with custom (edited) content...")
                 else:
@@ -260,7 +262,7 @@ async def approve_plan_api(payload: dict):
                 else:
                     results['message'] = "Plan approved, but appointment email sending failed."
                     logger.error(f"[{session_id}] Appointment email sending failed: {appointment_send_res.get('error')}")
-                    # Still return 200 if other parts succeeded, but indicate partial failure
+                    
                     return JSONResponse(content=results, status_code=200)
             else:
                 results['message'] = "Plan approved. Email content generated for review; sending not requested."
@@ -315,7 +317,7 @@ async def user_chat_api(payload: dict):
         )
 
     try:
-        # Process the question using the chat service
+        
         processing_start = time.time()
         result = process_user_question(question, soap_summary)
         processing_time = time.time() - processing_start
@@ -406,7 +408,7 @@ async def get_patients_api(session_id: str = None):
     """
     Get all patients.
     """
-    # Use provided session_id or generate new one
+
     client_session_id = session_id
     session_id = set_session_id(client_session_id or str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] Received request to get all patients.")
@@ -471,7 +473,6 @@ async def get_patient_api(token_id: str):
         )
     
 
-# --- Authentication Endpoints ---
 
 @app.post("/auth/google")
 async def google_auth(payload: dict):
@@ -486,12 +487,12 @@ async def google_auth(payload: dict):
     if not google_token:
         raise HTTPException(status_code=400, detail="Google token is required")
     
-    # Verify Google token
+    
     user_data = verify_google_token(google_token)
     if not user_data:
         raise HTTPException(status_code=401, detail="Invalid Google token")
     
-    # Create JWT token
+    
     jwt_token = create_jwt_token(user_data)
     
     logger.info(f"[{session_id}] User authenticated: {user_data['email']}")
@@ -551,14 +552,14 @@ async def get_patient_soap_records_api(patient_token_id: str):
         records = get_patient_soap_records(patient_token_id)
         voice_recordings = get_voice_recordings(patient_token_id)
         
-        # Create a map of soap_record_id -> voice recording storage_path
+        
         voice_recording_map = {}
         for vr in voice_recordings:
             soap_record_id = vr.get('soap_record_id')
             if soap_record_id:
                 voice_recording_map[soap_record_id] = vr.get('storage_path')
         
-        # Structure records to include both SOAP and transcript
+        
         formatted_records = []
         for record in records:
             record_id = record.get("id")
@@ -567,7 +568,7 @@ async def get_patient_soap_records_api(patient_token_id: str):
                 "id": record_id,
                 "patient_token_id": record.get("patient_token_id"),
                 "audio_file_name": record.get("audio_file_name"),
-                "storage_path": storage_path,  # Add storage path for playback
+                "storage_path": storage_path, 
                 "transcript": record.get("transcript"),
                 "original_transcript": record.get("original_transcript"),
                 "soap_sections": record.get("soap_sections"),
@@ -642,3 +643,130 @@ async def update_soap_record_api(record_id: int, payload: dict):
             },
             status_code=500
         )
+
+
+@app.get("/download_audio")
+async def download_audio(request: Request, storage_path: str):
+    """
+    Download encrypted audio from Supabase storage, decrypt it server-side,
+    and stream back the plaintext audio bytes with the appropriate content-type.
+
+    Query params:
+    - storage_path: path in the bucket (e.g. "<patient_token>/<timestamp>_file.wav")
+    """
+    session_id = set_session_id(str(uuid.uuid4())[:8])
+    logger.info(f"[{session_id}] 🎵 Download audio request for: {storage_path}")
+    
+    try:
+        bucket = os.getenv('SUPABASE_STORAGE_BUCKET')
+        if not bucket:
+            logger.error(f"[{session_id}] SUPABASE_STORAGE_BUCKET not configured")
+            raise HTTPException(status_code=500, detail="SUPABASE_STORAGE_BUCKET not configured on server")
+
+        logger.info(f"[{session_id}] 📦 Attempting to download from bucket: {bucket}")
+        
+        
+        try:
+            download_res = supabase.storage.from_(bucket).download(storage_path)
+            logger.info(f"[{session_id}] ✅ Download response received, type: {type(download_res)}")
+        except Exception as download_error:
+            logger.error(f"[{session_id}] ❌ Supabase download failed: {download_error}")
+            raise HTTPException(status_code=404, detail=f"File not found in storage: {storage_path}")
+
+        
+        enc_raw = None
+        if isinstance(download_res, bytes):
+            enc_raw = download_res
+            logger.info(f"[{session_id}] 📥 Downloaded bytes directly, size: {len(enc_raw)} bytes")
+        else:
+            
+            if hasattr(download_res, 'content'):
+                enc_raw = download_res.content
+                logger.info(f"[{session_id}] 📥 Downloaded via .content, size: {len(enc_raw)} bytes")
+            elif hasattr(download_res, 'read'):
+                try:
+                    enc_raw = download_res.read()
+                    logger.info(f"[{session_id}] 📥 Downloaded via .read(), size: {len(enc_raw)} bytes")
+                except Exception as read_error:
+                    logger.error(f"[{session_id}] ❌ Failed to read response: {read_error}")
+                    enc_raw = None
+
+        if enc_raw is None:
+            
+            if isinstance(download_res, dict) and download_res.get('error'):
+                logger.error(f"[{session_id}] ❌ Supabase download error: {download_res.get('error')}")
+                raise HTTPException(status_code=500, detail=str(download_res.get('error')))
+            logger.error(f"[{session_id}] ❌ Failed to extract bytes from download response")
+            raise HTTPException(status_code=500, detail="Failed to download audio from storage")
+
+        
+        logger.info(f"[{session_id}] 🔓 Starting decryption...")
+        enc_b64 = base64.b64encode(enc_raw).decode('utf-8')
+        
+        try:
+            plaintext = decrypt_bytes(enc_b64)
+            logger.info(f"[{session_id}] ✅ Decryption successful, plaintext size: {len(plaintext)} bytes")
+        except Exception as decrypt_error:
+            logger.error(f"[{session_id}] ❌ Decryption failed: {decrypt_error}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to decrypt audio: {str(decrypt_error)}")
+
+        
+        mime_type, _ = mimetypes.guess_type(storage_path)
+        if not mime_type:
+            mime_type = 'audio/wav'  
+            logger.info(f"[{session_id}] ℹ️ Could not determine mime type, using default: {mime_type}")
+        else:
+            logger.info(f"[{session_id}] 📄 Detected mime type: {mime_type}")
+
+        
+        total = len(plaintext)
+        range_header = request.headers.get('range')
+        
+        if range_header:
+            logger.info(f"[{session_id}] 📍 Range request received: {range_header}")
+            
+            try:
+                unit, ranges = range_header.split('=')
+                start_str, end_str = ranges.split('-')
+                start = int(start_str) if start_str else 0
+                end = int(end_str) if end_str else total - 1
+            except Exception as parse_error:
+                logger.warning(f"[{session_id}] ⚠️ Failed to parse range header, using full range: {parse_error}")
+                start = 0
+                end = total - 1
+
+            # Validate range
+            if start < 0: start = 0
+            if end >= total: end = total - 1
+            if start > end:
+                logger.error(f"[{session_id}] ❌ Invalid range: {start}-{end}")
+                raise HTTPException(status_code=416, detail='Requested Range Not Satisfiable')
+
+            chunk = plaintext[start:end+1]
+            headers = {
+                'Content-Range': f'bytes {start}-{end}/{total}',
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(len(chunk)),
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            }
+            logger.info(f"[{session_id}] 📤 Sending partial content: bytes {start}-{end}/{total}")
+            return StreamingResponse(io.BytesIO(chunk), status_code=206, media_type=mime_type, headers=headers)
+
+        
+        logger.info(f"[{session_id}] 📤 Sending full content: {total} bytes")
+        headers = {
+            'Accept-Ranges': 'bytes',
+            'Content-Length': str(total),
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+        }
+        return StreamingResponse(io.BytesIO(plaintext), media_type=mime_type, headers=headers)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{session_id}] ❌ Unexpected error in download_audio: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
