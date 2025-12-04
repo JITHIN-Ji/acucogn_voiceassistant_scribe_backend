@@ -15,7 +15,7 @@ from agent.config import EMAIL_ENABLED, SENDGRID_API_KEY, logger
 def sanitize_excel_data(value) -> Any:
     """Sanitize data to prevent Excel formula interpretation"""
     if isinstance(value, str):
-        # If starts with =, +, -, or @, prefix with apostrophe to treat as text
+        
         if value.startswith(('=', '+', '-', '@')):
             return "'" + value
     return value
@@ -36,7 +36,7 @@ def save_medicine_to_excel(medicines: List[str], filename="medicine_plan.xlsx") 
     file_path = os.path.join("medicine", filename)
     os.makedirs("medicine", exist_ok=True)
 
-    # Atomic write
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         tmp_path = tmp.name
     df.to_excel(tmp_path, index=False)
@@ -56,11 +56,11 @@ def send_email_schedule(details: str, user_email: str, email_content: str = None
         logger.error("SendGrid API key not set.")
         print("[DEBUG] SendGrid API key not set.")
         return "Email service not configured."
-    # Use custom email content if provided, otherwise use details
+    
     content_to_send = email_content if email_content else details
     
     message = Mail(
-        from_email='jithinjithuedpl922@gmail.com',  # Use your verified sender
+        from_email='jithinjithuedpl922@gmail.com',  
         to_emails=user_email,
         subject='Appointment Schedule',
         plain_text_content=content_to_send

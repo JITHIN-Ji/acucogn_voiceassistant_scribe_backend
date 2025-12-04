@@ -51,7 +51,7 @@ def transcribe_with_deepgram(audio_path: str, diarize: bool = True, language: st
         
         source = {"buffer": buffer}
 
-        dg_model = os.getenv("DEEPGRAM_MODEL", "nova-3-medical")
+        dg_model = os.getenv("DEEPGRAM_MODEL", "nova-2")
         speaker_count_env = os.getenv("DEEPGRAM_SPEAKER_COUNT")
         diarize_speaker_count: Optional[int] = None
         try:
@@ -66,7 +66,7 @@ def transcribe_with_deepgram(audio_path: str, diarize: bool = True, language: st
             "punctuate": True,
             "diarize": diarize,
             "utterances": diarize,
-            "language": language
+            "detect_language": True,
         }
         if diarize and diarize_speaker_count:
             options["diarize_speaker_count"] = diarize_speaker_count

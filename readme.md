@@ -54,6 +54,24 @@ SENDGRID_API_KEY=YOUR_SENDGRID_API_KEY
 # Enable or disable email sending
 EMAIL_ENABLED=true
 
+# AES-256 Encryption
+# The application encrypts sensitive data (patient name, address, phone number,
+# problem, transcripts, SOAP sections and uploaded audio) using AES-256-GCM.
+# Set a 32-byte base64-encoded key in the `AES256_KEY` environment variable.
+# Generate a key locally with:
+#
+# PowerShell (recommended):
+# ```powershell
+# python -m backend.utils.keygen
+# ```
+#
+# Then set it for your session (PowerShell):
+# ```powershell
+# $env:AES256_KEY = 'BASE64_KEY_FROM_KEYGEN'
+# ```
+#
+# Note: rotating the key requires re-encrypting stored data. Keep the key secure.
+
 
 
 ### HOW TO Run

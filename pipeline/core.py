@@ -14,9 +14,8 @@ class MedicalAudioProcessor:
         return ensure_wav(audio_path)
 
     def transcribe_file(self, audio_path: str, beam_size: int = 5):
-        # beam_size retained for compatibility; unused by Deepgram
-        return transcribe_with_deepgram(audio_path, diarize=True, language="en")
-
+    
+        return transcribe_with_deepgram(audio_path, diarize=True)
     def query_gemini(self, transcript: str) -> str:
         return query_gemini_summary(transcript)
     

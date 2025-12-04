@@ -56,11 +56,11 @@ def process_appointment(plan_section: str, user_email: str, send_email: bool = T
             if appointment_text.lower() != "none" and appointment_text.strip():
                 logger.info(f"Processing appointment: {appointment_text}")
                 
-                # Generate email content
+                
                 email_content = generate_appointment_email_content(appointment_text, plan_section)
                 
                 if not send_email:
-                    # Return email content for preview without sending
+                    
                     logger.info("📧 Email preview generated (doctor approval stage)")
                     return {
                         "status": "success",
@@ -68,8 +68,8 @@ def process_appointment(plan_section: str, user_email: str, send_email: bool = T
                         "message": "Email content generated for preview"
                     }
                 
-                # Actually send the email
-                # Use custom email content if provided (from doctor's edits), otherwise use generated content
+                
+                
                 content_to_send = custom_email_content if custom_email_content else email_content
                 email_result = send_email_schedule(appointment_text, user_email, email_content=content_to_send)
                 logger.info("📤 Email send attempted via SendGrid")

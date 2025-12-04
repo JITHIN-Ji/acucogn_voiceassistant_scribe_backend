@@ -29,7 +29,7 @@ def verify_google_token(token: str) -> Optional[Dict]:
             'email': idinfo['email'],
             'name': idinfo.get('name', ''),
             'picture': idinfo.get('picture', ''),
-            'sub': idinfo['sub']  # Google user ID
+            'sub': idinfo['sub']  
         }
     except ValueError as e:
         print(f"Token verification failed: {e}")

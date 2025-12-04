@@ -19,7 +19,7 @@ logging.basicConfig(
     format="%(asctime)s - [%(session_id)s] - %(levelname)s - %(name)s - %(message)s"
 )
 
-# Add the filter to all handlers
+
 for handler in logging.root.handlers:
     handler.addFilter(SessionContextFilter())
 
@@ -28,14 +28,14 @@ logger = logging.getLogger("MedicalAgent")
 def set_session_id(session_id: str = None)-> str:
     """Set session ID for logging context"""
     if session_id is None:
-        session_id = str(uuid.uuid4())[:8]  # Generate 8-char unique ID
+        session_id = str(uuid.uuid4())[:8]  
     session_id_var.set(session_id)
     logger.info(f"Session ID set to: {session_id}")
     return session_id
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Optional Deepgram API key for speech-to-text
+
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
 EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "false").lower() == "true"
@@ -51,7 +51,7 @@ llm = ChatGoogleGenerativeAI(
     temperature=0
 )
 
-# LLM Prompt for agent analysis
+
 AGENT_ANALYSIS_PROMPT = """
 Analyze this medical plan section and extract information:
 
