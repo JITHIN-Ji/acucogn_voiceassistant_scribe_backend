@@ -313,22 +313,6 @@ def create_logged_user(email: str) -> Dict:
     return data or {**payload, 'status': 'success'}
 
 
-def get_logged_user(user_id: str) -> Optional[Dict]:
-    res = supabase.table('logged_users').select('*').eq('id', user_id).limit(1).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase get_logged_user error: {res.error}")
-        raise Exception(res.error)
-    rows = res.data or []
-    user = rows[0] if rows else None
-    if user:
-        try:
-            if user.get('email'):
-                user['email'] = decrypt_text(user.get('email'))
-        except Exception:
-            logger.exception('Failed to decrypt logged user email')
-    return user
-
-
 def get_logged_user_by_email(email: str) -> Optional[Dict]:
     """Lookup logged user by deterministic email hash (case-insensitive)."""
     email_norm = (email or '').strip().lower()
