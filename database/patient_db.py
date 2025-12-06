@@ -537,4 +537,6 @@ def get_or_create_logged_user(email: str) -> Dict:
     existing = get_logged_user_by_email(email)
     if existing:
         return existing
+
     return create_logged_user(email)
+
