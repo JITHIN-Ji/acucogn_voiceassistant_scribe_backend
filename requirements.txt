@@ -17,3 +17,5 @@ PyJWT==2.8.0
 supabase
 cryptography
 pyodbc
+azure-storage-blob==12.24.0
+
