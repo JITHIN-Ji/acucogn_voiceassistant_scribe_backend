@@ -30,8 +30,10 @@ from database.patient_db import (
     get_voice_recordings,
     get_logged_user_by_email,
     create_logged_user,
+    get_or_create_logged_user,
 )
-from database.supabase_client import supabase
+from database.azure_client import blob_service_client
+
 from utils.crypto import decrypt_bytes
 
 load_dotenv()
@@ -393,9 +395,18 @@ async def create_patient_api(payload: dict, user: dict = Depends(get_current_use
         )
 
     try:
-        # Get logged user (already created at login)
+        
         logged = get_logged_user_by_email(user['email'])
+        if not logged:
+            logger.info(f"[{session_id}] Logged user not found for email: {user.get('email')}; creating user record")
+            logged = get_or_create_logged_user(user['email'])
+
+        if not logged:
+            raise Exception("Authenticated user not found and could not be created")
+
         patient = create_patient(name, address, phone_number, problem, user_id=logged['id'])
+        if patient is None:
+            raise Exception("Patient creation failed: returned None")
         logger.info(f"[{session_id}] Patient created: {patient.get('id')}")
         
         return JSONResponse(
@@ -429,6 +440,15 @@ async def get_patients_api(user: dict = Depends(get_current_user), session_id: s
 
     try:
         logged = get_logged_user_by_email(user['email'])
+        if not logged:
+            logger.warning(f"[{session_id_obj}] Logged user not found for email: {user.get('email')}")
+            return JSONResponse(
+                content={
+                    "status": "error",
+                    "message": "Authenticated user not found in database."
+                },
+                status_code=404
+            )
         patients = get_all_patients(user_id=logged['id'])
         logger.info(f"[{session_id_obj}] Retrieved {len(patients)} patients")
         
@@ -679,56 +699,32 @@ async def update_soap_record_api(record_id: int, payload: dict):
 @app.get("/download_audio")
 async def download_audio(request: Request, storage_path: str):
     """
-    Download encrypted audio from Supabase storage, decrypt it server-side,
+    Download encrypted audio from Azure Blob Storage, decrypt it server-side,
     and stream back the plaintext audio bytes with the appropriate content-type.
 
     Query params:
-    - storage_path: path in the bucket (e.g. "<patient_token>/<timestamp>_file.wav")
+    - storage_path: path in the blob container (e.g. "<patient_id>/<timestamp>_file.wav")
     """
     session_id = set_session_id(str(uuid.uuid4())[:8])
     logger.info(f"[{session_id}] 🎵 Download audio request for: {storage_path}")
     
     try:
-        bucket = os.getenv('SUPABASE_STORAGE_BUCKET')
-        if not bucket:
-            logger.error(f"[{session_id}] SUPABASE_STORAGE_BUCKET not configured")
-            raise HTTPException(status_code=500, detail="SUPABASE_STORAGE_BUCKET not configured on server")
-
-        logger.info(f"[{session_id}] 📦 Attempting to download from bucket: {bucket}")
+        
+        container_name = os.getenv('AZURE_STORAGE_CONTAINER', 'voice-recordings')
+        logger.info(f"[{session_id}] 📦 Attempting to download from container: {container_name}")
         
         
         try:
-            download_res = supabase.storage.from_(bucket).download(storage_path)
-            logger.info(f"[{session_id}] ✅ Download response received, type: {type(download_res)}")
+            blob_client = blob_service_client.get_blob_client(
+                container=container_name,
+                blob=storage_path
+            )
+            download_stream = blob_client.download_blob()
+            enc_raw = download_stream.readall()
+            logger.info(f"[{session_id}] ✅ Downloaded {len(enc_raw)} bytes from Azure Blob Storage")
         except Exception as download_error:
-            logger.error(f"[{session_id}] ❌ Supabase download failed: {download_error}")
+            logger.error(f"[{session_id}] ❌ Azure Blob download failed: {download_error}")
             raise HTTPException(status_code=404, detail=f"File not found in storage: {storage_path}")
-
-        
-        enc_raw = None
-        if isinstance(download_res, bytes):
-            enc_raw = download_res
-            logger.info(f"[{session_id}] 📥 Downloaded bytes directly, size: {len(enc_raw)} bytes")
-        else:
-            
-            if hasattr(download_res, 'content'):
-                enc_raw = download_res.content
-                logger.info(f"[{session_id}] 📥 Downloaded via .content, size: {len(enc_raw)} bytes")
-            elif hasattr(download_res, 'read'):
-                try:
-                    enc_raw = download_res.read()
-                    logger.info(f"[{session_id}] 📥 Downloaded via .read(), size: {len(enc_raw)} bytes")
-                except Exception as read_error:
-                    logger.error(f"[{session_id}] ❌ Failed to read response: {read_error}")
-                    enc_raw = None
-
-        if enc_raw is None:
-            
-            if isinstance(download_res, dict) and download_res.get('error'):
-                logger.error(f"[{session_id}] ❌ Supabase download error: {download_res.get('error')}")
-                raise HTTPException(status_code=500, detail=str(download_res.get('error')))
-            logger.error(f"[{session_id}] ❌ Failed to extract bytes from download response")
-            raise HTTPException(status_code=500, detail="Failed to download audio from storage")
 
         
         logger.info(f"[{session_id}] 🔓 Starting decryption...")
@@ -766,7 +762,7 @@ async def download_audio(request: Request, storage_path: str):
                 start = 0
                 end = total - 1
 
-            # Validate range
+            
             if start < 0: start = 0
             if end >= total: end = total - 1
             if start > end:

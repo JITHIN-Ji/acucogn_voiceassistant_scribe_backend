@@ -1,22 +1,18 @@
-"""
-Supabase-backed patient database functions.
 
-This module provides the same API used elsewhere in the codebase
-but stores data in Supabase Postgres tables and uploads audio to
-Supabase Storage.
-"""
 import os
 import uuid
 import json
 import time
 import logging
+from datetime import datetime
 from typing import List, Dict, Optional
-
-from database.supabase_client import supabase
-
+import pyodbc
 import io
 import base64
 import hashlib
+from azure.storage.blob import BlobServiceClient
+
+from database.azure_client import conn_str, blob_service_client
 from utils.crypto import (
     encrypt_text,
     decrypt_text,
@@ -26,8 +22,17 @@ from utils.crypto import (
     decrypt_bytes,
 )
 
-
 logger = logging.getLogger("PatientDB")
+
+CONTAINER_NAME = "voice-recordings"
+
+
+def row_to_dict(cursor, row):
+    """Convert pyodbc row to dictionary"""
+    if row is None:
+        return None
+    columns = [column[0] for column in cursor.description]
+    return dict(zip(columns, row))
 
 
 def generate_token_id() -> str:
@@ -38,6 +43,16 @@ def generate_user_id() -> str:
     return str(uuid.uuid4())
 
 
+def convert_datetime_fields(data: Dict) -> Dict:
+    """Convert datetime objects to ISO format strings for JSON serialization"""
+    if data is None:
+        return data
+    for key in data:
+        if isinstance(data[key], datetime):
+            data[key] = data[key].isoformat()
+    return data
+
+
 def create_patient(name: str, address: str = '', phone_number: str = '', problem: str = '', user_id: str = '') -> Dict:
     """Create a patient linked to a logged user by `user_id`.
 
@@ -46,251 +61,398 @@ def create_patient(name: str, address: str = '', phone_number: str = '', problem
     if not user_id:
         raise ValueError('user_id is required to create a patient')
 
-    payload = {
-        'user_id': user_id,
-        'name': encrypt_text(name),
-        'address': encrypt_text(address),
-        'phone_number': encrypt_text(phone_number),
-        'problem': encrypt_text(problem),
-    }
-    res = supabase.table('patients').insert(payload).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase create_patient error: {res.error}")
-        raise Exception(res.error)
-    logger.info(f"Patient created for user_id: {user_id}")
-    
-    data = (res.data or [None])[0]
-    return data or {**payload, 'status': 'success'}
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        
+        query = """
+            INSERT INTO patients (user_id, name, address, phone_number, problem)
+            OUTPUT inserted.id
+            VALUES (?, ?, ?, ?, ?)
+        """
+        cursor.execute(query, (
+            user_id,
+            encrypt_text(name),
+            encrypt_text(address),
+            encrypt_text(phone_number),
+            encrypt_text(problem)
+        ))
+        
+        result = cursor.fetchone()
+        if result is None:
+            raise Exception("Failed to insert patient record")
+        
+        new_id = result[0]
+        conn.commit()
+        
+        
+        cursor.execute("SELECT * FROM patients WHERE id = ?", (new_id,))
+        row = cursor.fetchone()
+        patient = row_to_dict(cursor, row)
+        
+        logger.info(f"Patient created for user_id: {user_id}, patient_id: {new_id}")
+        
+        if patient is None:
+            raise Exception(f"Patient record not found after insertion with ID: {new_id}")
+        
+        
+        patient['name'] = decrypt_text(patient['name'])
+        patient['address'] = decrypt_text(patient['address'])
+        patient['phone_number'] = decrypt_text(patient['phone_number'])
+        patient['problem'] = decrypt_text(patient['problem'])
+        
+        
+        convert_datetime_fields(patient)
+        
+        return patient
+    except Exception as e:
+        logger.error(f"Azure create_patient error: {e}")
+        if conn:
+            conn.rollback()
+        raise Exception(f"Failed to create patient: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_all_patients(user_id: str = '') -> List[Dict]:
-    query = supabase.table('patients').select('*')
-    if user_id:
-        query = query.eq('user_id', user_id)
-    res = query.order('created_at', desc=True).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase get_all_patients error: {res.error}")
-        raise Exception(res.error)
-    rows = res.data or []
-    
-    for r in rows:
-        try:
-            if 'name' in r and r.get('name'):
-                r['name'] = decrypt_text(r.get('name'))
-            if 'address' in r and r.get('address'):
-                r['address'] = decrypt_text(r.get('address'))
-            if 'phone_number' in r and r.get('phone_number'):
-                r['phone_number'] = decrypt_text(r.get('phone_number'))
-            if 'problem' in r and r.get('problem'):
-                r['problem'] = decrypt_text(r.get('problem'))
-        except Exception:
-            logger.exception('Failed to decrypt patient fields')
-    return rows
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        if user_id:
+            query = "SELECT * FROM patients WHERE user_id = ? ORDER BY created_at DESC"
+            cursor.execute(query, (user_id,))
+        else:
+            query = "SELECT * FROM patients ORDER BY created_at DESC"
+            cursor.execute(query)
+        
+        rows = cursor.fetchall()
+        patients = [row_to_dict(cursor, row) for row in rows]
+        
+        
+        for patient in patients:
+            try:
+                if patient.get('name'):
+                    patient['name'] = decrypt_text(patient['name'])
+                if patient.get('address'):
+                    patient['address'] = decrypt_text(patient['address'])
+                if patient.get('phone_number'):
+                    patient['phone_number'] = decrypt_text(patient['phone_number'])
+                if patient.get('problem'):
+                    patient['problem'] = decrypt_text(patient['problem'])
+                
+                convert_datetime_fields(patient)
+            except Exception:
+                logger.exception('Failed to decrypt patient fields')
+        
+        return patients
+    except Exception as e:
+        logger.error(f"Azure get_all_patients error: {e}")
+        raise Exception(f"Failed to get patients: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_patient_by_id(patient_id: int, user_id: str = '') -> Optional[Dict]:
-    res = supabase.table('patients').select('*').eq('id', patient_id).limit(1).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase get_patient_by_id error: {res.error}")
-        raise Exception(res.error)
-    data = res.data or []
-    patient = data[0] if data else None
-
-    
-    if patient and user_id and patient.get('user_id') != user_id:
-        logger.warning(f"User {user_id} attempted to access patient {patient_id} belonging to {patient.get('user_id')}")
-        return None
-
-    if patient:
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        query = "SELECT TOP 1 * FROM patients WHERE id = ?"
+        cursor.execute(query, (patient_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        patient = row_to_dict(cursor, row)
+        
+        
+        if user_id and patient.get('user_id') != user_id:
+            logger.warning(f"User {user_id} attempted to access patient {patient_id} belonging to {patient.get('user_id')}")
+            return None
+        
+        
         try:
             if patient.get('name'):
-                patient['name'] = decrypt_text(patient.get('name'))
+                patient['name'] = decrypt_text(patient['name'])
             if patient.get('address'):
-                patient['address'] = decrypt_text(patient.get('address'))
+                patient['address'] = decrypt_text(patient['address'])
             if patient.get('phone_number'):
-                patient['phone_number'] = decrypt_text(patient.get('phone_number'))
+                patient['phone_number'] = decrypt_text(patient['phone_number'])
             if patient.get('problem'):
-                patient['problem'] = decrypt_text(patient.get('problem'))
+                patient['problem'] = decrypt_text(patient['problem'])
+            
+            convert_datetime_fields(patient)
         except Exception:
             logger.exception('Failed to decrypt patient')
-    return patient
+        
+        return patient
+    except Exception as e:
+        logger.error(f"Azure get_patient_by_id error: {e}")
+        raise Exception(f"Failed to get patient: {e}")
+    finally:
+        if conn:
+            conn.close()
 
-
-def update_patient(patient_id: int, name: str = None, address: str = None,
-                   phone_number: str = None, problem: str = None) -> bool:
-    updates = {}
-    if name is not None:
-        updates['name'] = encrypt_text(name)
-    if address is not None:
-        updates['address'] = encrypt_text(address)
-    if phone_number is not None:
-        updates['phone_number'] = encrypt_text(phone_number)
-    if problem is not None:
-        updates['problem'] = encrypt_text(problem)
-    if not updates:
-        return False
-    updates['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
-    res = supabase.table('patients').update(updates).eq('id', patient_id).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase update_patient error: {res.error}")
-        raise Exception(res.error)
-    return True
-
-
-def delete_patient(patient_id: int) -> bool:
-    res = supabase.table('patients').delete().eq('id', patient_id).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase delete_patient error: {res.error}")
-        raise Exception(res.error)
-    return True
 
 
 def save_soap_record(patient_id: int, audio_file_name: str = None, audio_local_path: str = None,
                      transcript: str = '', original_transcript: Optional[str] = None,
                      soap_sections: Optional[Dict] = None) -> Dict:
-    """Save a SOAP record linked to `patient_id` and optionally upload audio to Supabase storage.
+    """Save a SOAP record linked to `patient_id` and optionally upload audio to Azure Blob Storage.
 
     Returns inserted record dict (including id) and storage_path if uploaded.
     """
     storage_path = None
+    conn = None
+    
     try:
+        
         if audio_local_path and os.path.exists(audio_local_path):
-            bucket = os.getenv('SUPABASE_STORAGE_BUCKET', )
             timestamp = int(time.time())
             filename = audio_file_name or os.path.basename(audio_local_path)
             storage_path = f"{patient_id}/{timestamp}_{filename}"
+            
             with open(audio_local_path, 'rb') as f:
                 raw = f.read()
+            
             try:
+                
                 enc_b64 = encrypt_bytes(raw)
                 enc_bytes = base64.b64decode(enc_b64)
-                upload_res = supabase.storage.from_(bucket).upload(storage_path, enc_bytes)
-                logger.info(f"Uploaded audio file to Supabase storage: {storage_path}")
-            except Exception:
+                
+                
+                blob_client = blob_service_client.get_blob_client(
+                    container=CONTAINER_NAME,
+                    blob=storage_path
+                )
+                blob_client.upload_blob(enc_bytes, overwrite=True)
+                logger.info(f"Uploaded audio file to Azure Blob Storage: {storage_path}")
+            except Exception as upload_error:
                 logger.exception('Failed to encrypt/upload audio file')
-                raise
-
-            if isinstance(upload_res, dict) and upload_res.get('error'):
-                logger.error(f"Supabase storage upload error: {upload_res.get('error')}")
-                raise Exception(upload_res.get('error'))
-
-        payload = {
-            'patient_id': patient_id,
-            'audio_file_name': audio_file_name,
-            'transcript': encrypt_text(transcript),
-            'original_transcript': encrypt_text(original_transcript) if original_transcript is not None else None,
-            'soap_sections': encrypt_json(soap_sections or {})
-        }
-        res = supabase.table('soap_records').insert(payload).execute()
-        if getattr(res, 'error', None):
-            logger.error(f"Supabase insert soap_records error: {res.error}")
-            raise Exception(res.error)
-        record = (res.data or [None])[0]
-        if record is None:
+                raise Exception(f"Audio upload failed: {upload_error}")
+        
+        
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        
+        audio_file_to_store = storage_path if storage_path else audio_file_name
+        
+        query = """
+            INSERT INTO soap_records (patient_id, audio_file_name, transcript, original_transcript, soap_sections)
+            OUTPUT inserted.id
+            VALUES (?, ?, ?, ?, ?)
+        """
+        cursor.execute(query, (
+            patient_id,
+            audio_file_to_store,
+            encrypt_text(transcript),
+            encrypt_text(original_transcript) if original_transcript is not None else None,
+            encrypt_json(soap_sections or {})
+        ))
+        
+        result = cursor.fetchone()
+        if result is None:
             raise Exception('Failed to insert soap record')
-
+        
+        record_id = result[0]
+        conn.commit()
+        
+        # Now fetch the complete record
+        cursor.execute("SELECT * FROM soap_records WHERE id = ?", (record_id,))
+        row = cursor.fetchone()
+        record = row_to_dict(cursor, row)
+        
+        if not record:
+            raise Exception('Failed to retrieve inserted soap record')
+        
+        
         if storage_path:
-            rec_id = record.get('id')
-            voice_payload = {
-                'patient_id': patient_id,
-                'soap_record_id': rec_id,
-                'storage_path': storage_path,
-                'file_name': audio_file_name or os.path.basename(audio_local_path),
-                'is_realtime': False
-            }
-            vres = supabase.table('voice_recordings').insert(voice_payload).execute()
-            if getattr(vres, 'error', None):
-                logger.error(f"Supabase insert voice_recordings error: {vres.error}")
+            voice_query = """
+                INSERT INTO voice_recordings (patient_id, soap_record_id, storage_path, file_name, is_realtime)
+                VALUES (?, ?, ?, ?, ?)
+            """
+            cursor.execute(voice_query, (
+                patient_id,
+                record_id,
+                storage_path,
+                audio_file_name or os.path.basename(audio_local_path),
+                False
+            ))
+            conn.commit()
+        
         record['storage_path'] = storage_path
-
+        
+        
         try:
             if record.get('transcript'):
-                record['transcript'] = decrypt_text(record.get('transcript'))
+                record['transcript'] = decrypt_text(record['transcript'])
             if record.get('original_transcript'):
-                record['original_transcript'] = decrypt_text(record.get('original_transcript'))
+                record['original_transcript'] = decrypt_text(record['original_transcript'])
             if record.get('soap_sections'):
-                record['soap_sections'] = decrypt_json(record.get('soap_sections'))
+                record['soap_sections'] = decrypt_json(record['soap_sections'])
         except Exception:
             logger.exception('Failed to decrypt soap record')
+        
+        # Convert datetime fields
+        convert_datetime_fields(record)
+        
         return record
     except Exception as e:
-        logger.error(f"Error saving SOAP record to Supabase: {e}")
+        logger.error(f"Error saving SOAP record to Azure: {e}")
+        if conn:
+            conn.rollback()
         raise
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_patient_soap_records(patient_id: int) -> List[Dict]:
-    res = supabase.table('soap_records').select('*').eq('patient_id', patient_id).order('created_at', desc=True).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase get_patient_soap_records error: {res.error}")
-        raise Exception(res.error)
-    rows = res.data or []
-    for r in rows:
-        try:
-            if r.get('transcript'):
-                r['transcript'] = decrypt_text(r.get('transcript'))
-            if r.get('original_transcript'):
-                r['original_transcript'] = decrypt_text(r.get('original_transcript'))
-            if r.get('soap_sections'):
-                r['soap_sections'] = decrypt_json(r.get('soap_sections'))
-        except Exception:
-            logger.exception('Failed to decrypt soap record')
-    return rows
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        query = "SELECT * FROM soap_records WHERE patient_id = ? ORDER BY created_at DESC"
+        cursor.execute(query, (patient_id,))
+        
+        rows = cursor.fetchall()
+        records = [row_to_dict(cursor, row) for row in rows]
+        
+        
+        for record in records:
+            try:
+                if record.get('transcript'):
+                    record['transcript'] = decrypt_text(record['transcript'])
+                if record.get('original_transcript'):
+                    record['original_transcript'] = decrypt_text(record['original_transcript'])
+                if record.get('soap_sections'):
+                    record['soap_sections'] = decrypt_json(record['soap_sections'])
+                
+                convert_datetime_fields(record)
+            except Exception:
+                logger.exception('Failed to decrypt soap record')
+        
+        return records
+    except Exception as e:
+        logger.error(f"Azure get_patient_soap_records error: {e}")
+        raise Exception(f"Failed to get SOAP records: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
-def get_latest_soap_record(patient_id: int) -> Optional[Dict]:
-    records = get_patient_soap_records(patient_id)
-    return records[0] if records else None
 
 
 def update_soap_record(record_id: int, soap_sections: Dict) -> bool:
-    
-    enc = encrypt_json(soap_sections)
-    res = supabase.table('soap_records').update({'soap_sections': enc, 'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}).eq('id', record_id).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase update_soap_record error: {res.error}")
-        raise Exception(res.error)
-    return True
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        enc = encrypt_json(soap_sections)
+        query = "UPDATE soap_records SET soap_sections = ?, updated_at = GETDATE() WHERE id = ?"
+        cursor.execute(query, (enc, record_id))
+        conn.commit()
+        
+        return True
+    except Exception as e:
+        logger.error(f"Azure update_soap_record error: {e}")
+        if conn:
+            conn.rollback()
+        raise Exception(f"Failed to update SOAP record: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def save_voice_recording(patient_id: int, soap_record_id: int, file_path: str,
                          file_name: str, is_realtime: bool = False) -> Dict:
-    bucket = os.getenv('SUPABASE_STORAGE_BUCKET', 'recordings')
     timestamp = int(time.time())
     storage_path = f"{patient_id}/{timestamp}_{file_name}"
+    conn = None
+    
     try:
+        
         with open(file_path, 'rb') as f:
             raw = f.read()
+        
         enc_b64 = encrypt_bytes(raw)
         enc_bytes = base64.b64decode(enc_b64)
-        upload_res = supabase.storage.from_(bucket).upload(storage_path, enc_bytes)
-        logger.info(f"Uploaded audio file to Supabase storage: {storage_path}")
-
-        if isinstance(upload_res, dict) and upload_res.get('error'):
-            logger.error(f"Supabase storage upload error: {upload_res.get('error')}")
-            raise Exception(upload_res.get('error'))
-        payload = {
-            'patient_id': patient_id,
-            'soap_record_id': soap_record_id,
-            'storage_path': storage_path,
-            'file_name': file_name,
-            'is_realtime': is_realtime
-        }
-        res = supabase.table('voice_recordings').insert(payload).execute()
-        if getattr(res, 'error', None):
-            logger.error(f"Supabase insert voice_recordings error: {res.error}")
-            raise Exception(res.error)
-        return (res.data or [])[0]
+        
+        blob_client = blob_service_client.get_blob_client(
+            container=CONTAINER_NAME,
+            blob=storage_path
+        )
+        blob_client.upload_blob(enc_bytes, overwrite=True)
+        logger.info(f"Uploaded audio file to Azure Blob Storage: {storage_path}")
+        
+    
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        query = """
+            INSERT INTO voice_recordings (patient_id, soap_record_id, storage_path, file_name, is_realtime)
+            VALUES (?, ?, ?, ?, ?)
+        """
+        cursor.execute(query, (patient_id, soap_record_id, storage_path, file_name, is_realtime))
+        conn.commit()
+        
+        
+        cursor.execute("SELECT SCOPE_IDENTITY()")
+        recording_id = cursor.fetchone()[0]
+        
+        
+        cursor.execute("SELECT * FROM voice_recordings WHERE id = ?", (recording_id,))
+        row = cursor.fetchone()
+        recording = row_to_dict(cursor, row)
+        
+        
+        convert_datetime_fields(recording)
+        
+        return recording
     except Exception as e:
-        logger.error(f"Error saving voice recording to Supabase: {e}")
+        logger.error(f"Error saving voice recording to Azure: {e}")
+        if conn:
+            conn.rollback()
         raise
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_voice_recordings(patient_id: int) -> List[Dict]:
-    res = supabase.table('voice_recordings').select('*').eq('patient_id', patient_id).order('created_at', desc=True).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase get_voice_recordings error: {res.error}")
-        raise Exception(res.error)
-    return res.data or []
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        query = "SELECT * FROM voice_recordings WHERE patient_id = ? ORDER BY created_at DESC"
+        cursor.execute(query, (patient_id,))
+        
+        rows = cursor.fetchall()
+        recordings = [row_to_dict(cursor, row) for row in rows]
+        
+    
+        for recording in recordings:
+            convert_datetime_fields(recording)
+        
+        return recordings
+    except Exception as e:
+        logger.error(f"Azure get_voice_recordings error: {e}")
+        raise Exception(f"Failed to get voice recordings: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def create_logged_user(email: str) -> Dict:
@@ -299,37 +461,75 @@ def create_logged_user(email: str) -> Dict:
     
     email_norm = (email or '').strip().lower()
     email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
-    payload = {
-        'id': user_id,
-        'email': encrypt_text(email),
-        'email_hash': email_hash
-    }
-    res = supabase.table('logged_users').insert(payload).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase create_logged_user error: {res.error}")
-        raise Exception(res.error)
-    logger.info(f"Logged user created with id: {user_id}")
-    data = (res.data or [None])[0]
-    return data or {**payload, 'status': 'success'}
+    
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        query = """
+            INSERT INTO logged_users (id, email, email_hash)
+            VALUES (?, ?, ?)
+        """
+        cursor.execute(query, (user_id, encrypt_text(email), email_hash))
+        conn.commit()
+        
+        logger.info(f"Logged user created with id: {user_id}")
+        
+        
+        cursor.execute("SELECT * FROM logged_users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        user = row_to_dict(cursor, row)
+        
+        
+        if user and user.get('email'):
+            user['email'] = decrypt_text(user['email'])
+        
+        return user
+    except Exception as e:
+        logger.error(f"Azure create_logged_user error: {e}")
+        if conn:
+            conn.rollback()
+        raise Exception(f"Failed to create logged user: {e}")
+    finally:
+        if conn:
+            conn.close()
+
 
 
 def get_logged_user_by_email(email: str) -> Optional[Dict]:
     """Lookup logged user by deterministic email hash (case-insensitive)."""
     email_norm = (email or '').strip().lower()
     email_hash = hashlib.sha256(email_norm.encode('utf-8')).hexdigest()
-    res = supabase.table('logged_users').select('*').eq('email_hash', email_hash).limit(1).execute()
-    if getattr(res, 'error', None):
-        logger.error(f"Supabase get_logged_user_by_email error: {res.error}")
-        raise Exception(res.error)
-    rows = res.data or []
-    user = rows[0] if rows else None
-    if user:
+    
+    conn = None
+    try:
+        conn = pyodbc.connect(conn_str)
+        cursor = conn.cursor()
+        
+        query = "SELECT TOP 1 * FROM logged_users WHERE email_hash = ?"
+        cursor.execute(query, (email_hash,))
+        row = cursor.fetchone()
+        
+        if not row:
+            return None
+        
+        user = row_to_dict(cursor, row)
+        
+        
         try:
             if user.get('email'):
-                user['email'] = decrypt_text(user.get('email'))
+                user['email'] = decrypt_text(user['email'])
         except Exception:
             logger.exception('Failed to decrypt logged user email')
-    return user
+        
+        return user
+    except Exception as e:
+        logger.error(f"Azure get_logged_user_by_email error: {e}")
+        raise Exception(f"Failed to get logged user by email: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_or_create_logged_user(email: str) -> Dict:
@@ -337,11 +537,5 @@ def get_or_create_logged_user(email: str) -> Dict:
     existing = get_logged_user_by_email(email)
     if existing:
         return existing
+
     return create_logged_user(email)
-
-
-
-
-
-
-
